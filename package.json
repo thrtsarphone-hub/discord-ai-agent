@@ -1,0 +1,16 @@
+{
+  "name": "discord-ai-agent",
+  "version": "1.0.0",
+  "description": "Discord AI Agent with free AI models (OpenRouter), free image generation (Pollinations) and free web search (DuckDuckGo). Runs 24/7 free on Render.com",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  },
+  "license": "MIT"
+}
