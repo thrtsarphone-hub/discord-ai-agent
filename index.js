@@ -2,7 +2,7 @@
  * ============================================================
  *  Discord AI Agent (Hermes-Lite) — บอท AI สำหรับ Discord
  *  ใช้โมเดลฟรีจาก OpenRouter + สร้างรูปฟรีจาก Pollinations
- *  + ค้นเว็บฟรีผ่าน DuckDuckGo
+ *  + ค้นเว็บฟรีผ่าน DuckDuckGo + อ่านไฟล์ PDF (สรุป/ถาม-ตอบจากเอกสาร)
  *
  *  รันได้บน Render.com free tier ตลอด 24 ชั่วโมง
  *  ต้องมีแค่ 2 ค่า: DISCORD_TOKEN และ OPENROUTER_API_KEY
@@ -47,6 +47,12 @@ const SYSTEM_PROMPT =
 const MAX_MEMORY_TURNS = 20; // จำบทสนทนาล่าสุด (ครั้งถาม+ตอบ นับเป็น 1)
 const USER_COOLDOWN_MS = 3000; // กันสแปม: 3 วินาทีต่อผู้ใช้
 
+// ---------------- การอ่านไฟล์ PDF ----------------
+const MAX_PDF_MB = 10; // ขนาดไฟล์ PDF สูงสุดที่รับ
+const MAX_PDF_PAGES = 50; // อ่านสูงสุด 50 หน้าแรก (กันไฟล์ยักษ์กิน CPU ของเซิร์ฟเวอร์ฟรี)
+const MAX_PDF_CHARS = 12000; // จำกัดตัวอักษรที่ส่งให้โมเดล (ไฟล์ยาวมากจะใช้เนื้อหาส่วนต้น)
+const PDF_FOLLOWUP_CHARS = 6000; // เนื้อหาไฟล์ที่แนบไว้ ใช้ตอบคำถามต่อเนื่องด้วย /ask
+
 // ---------------- ความจำบทสนทนา (Memory) ----------------
 
 // เก็บใน RAM แยกตามห้อง (channel) — ถ้ารีสตาร์ทเซิร์ฟเวอร์ ความจำจะเริ่มใหม่
@@ -65,6 +71,27 @@ function pushHistory(channelId, role, content) {
 
 function clearHistory(channelId) {
   memory.delete(channelId);
+}
+
+// ความจำ "เอกสาร" แยกตามห้อง — จำไฟล์ PDF ล่าสุดของห้องนั้นไว้ให้ถามต่อได้
+// (เก็บแค่ไฟล์เดียว/ห้อง และจะหายถ้าพิมพ์ /reset หรือบอทรีสตาร์ท)
+const channelDocs = new Map(); // Map<channelId, {name, pages, text, at}>
+
+function setChannelDoc(channelId, doc) {
+  channelDocs.set(channelId, { ...doc, at: Date.now() });
+}
+
+function getDocContext(channelId, maxChars = PDF_FOLLOWUP_CHARS) {
+  const doc = channelDocs.get(channelId);
+  if (!doc) return '';
+  return (
+    `The user previously attached a PDF file "${doc.name}" (${doc.pages} pages) in this channel. ` +
+    `Here is its extracted text (may be truncated):\n---\n` +
+    doc.text.slice(0, maxChars) +
+    `\n---\nWhen the user asks about this document, answer from the text above. ` +
+    `If the answer is not in the document, say so honestly. ` +
+    `Keep answers brief and to the point.`
+  );
 }
 
 // ---------------- ผู้ช่วยเล็ก ๆ ----------------
@@ -125,7 +152,7 @@ async function getFreeModels() {
   }
 }
 
-async function chatWithAI(messageHistory, extraContext = '') {
+async function chatWithAI(messageHistory, webContext = '', docContext = '') {
   if (!OPENROUTER_API_KEY) {
     throw new Error(
       'ยังไม่ได้ตั้งค่า OPENROUTER_API_KEY — ดูวิธีทำในคู่มือ (PDF) ที่ได้มาพร้อมบอทนี้'
@@ -133,12 +160,15 @@ async function chatWithAI(messageHistory, extraContext = '') {
   }
 
   const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
-  if (extraContext) {
+  if (docContext) {
+    messages.push({ role: 'system', content: docContext });
+  }
+  if (webContext) {
     messages.push({
       role: 'system',
       content:
         'Web search results for the user latest question:\n\n' +
-        extraContext +
+        webContext +
         '\n\nUse these results when relevant and cite the links at the end of your answer.',
     });
   }
@@ -263,6 +293,117 @@ async function generateImage(prompt) {
   return { buffer, url };
 }
 
+// ---------------- PDF: อ่านไฟล์ PDF ที่แนบใน Discord ----------------
+
+const NO_TEXT_MSG =
+  '⚠️ ไฟล์นี้**ไม่มีข้อความให้อ่านเลย** — น่าจะเป็น PDF ภาพสแกน (ส่องกล้อง/ถ่ายเป็นภาพ) ซึ่งบอทอ่านไม่ได้ครับ\n' +
+  'ลองใช้ไฟล์ PDF ที่สร้างจาก Word / Google Docs / Canva หรือไฟล์ที่**ลากเลือกข้อความได้**ดูนะ';
+
+function isPdfAttachment(att) {
+  if (!att) return false;
+  const name = att.name || '';
+  return (
+    (att.contentType || '').startsWith('application/pdf') || /\.pdf$/i.test(name)
+  );
+}
+
+async function extractPdfText(att) {
+  if (att.size > MAX_PDF_MB * 1024 * 1024) {
+    throw new Error(`ไฟล์ใหญ่เกิน ${MAX_PDF_MB}MB — ลองใช้ไฟล์ที่เล็กกว่านี้นะ`);
+  }
+
+  let pdfjsLib;
+  try {
+    // legacy build = รุ่นทำงานบน Node.js ได้โดยตรง (ไม่ต้องมีเบราว์เซอร์)
+    pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+  } catch (err) {
+    throw new Error(
+      'โมดูล pdfjs-dist ยังไม่ถูกติดตั้ง — ตรวจว่าอัปโหลด package.json ตัวล่าสุดแล้วกด Deploy ใหม่'
+    );
+  }
+
+  const res = await fetchWithTimeout(att.url, {}, 60000);
+  if (!res.ok) {
+    throw new Error('ดาวน์โหลดไฟล์จาก Discord ไม่สำเร็จ (HTTP ' + res.status + ')');
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+
+  let doc;
+  try {
+    doc = await pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      verbosity: 0,
+    }).promise;
+  } catch (err) {
+    if (err && err.name === 'PasswordException') {
+      throw new Error('ไฟล์ PDF นี้ตั้งรหัสผ่านไว้ บอทเปิดไม่ได้ครับ');
+    }
+    throw new Error('เปิดไฟล์ PDF ไม่ได้ — ไฟล์อาจเสียหายหรือไม่ใช่ PDF จริง');
+  }
+
+  try {
+    const maxPages = Math.min(doc.numPages, MAX_PDF_PAGES);
+    let text = '';
+    for (let i = 1; i <= maxPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      text +=
+        content.items.map((it) => it.str + (it.hasEOL ? '\n' : '')).join('') + '\n';
+      page.cleanup();
+      // ถ้าได้ข้อความเกินพอแล้วให้หยุดเร็ว (สุดท้ายก็จะตัดที่ MAX_PDF_CHARS อยู่ดี)
+      if (text.length > MAX_PDF_CHARS * 2) break;
+    }
+
+    const pages = doc.numPages;
+    const clean = text
+      .replace(/\r/g, '')
+      .replace(/[\u0000-\u0008\u000b-\u001f]/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/ {2,}/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return { pages, text: clean };
+  } finally {
+    await doc.destroy().catch(() => {});
+  }
+}
+
+// อ่านไฟล์ -> เก็บลงความจำเอกสารของห้อง -> ถามโมเดล -> คืนคำตอบ
+async function readAndAnswerPdf(channelId, att, question) {
+  const { pages, text } = await extractPdfText(att);
+  if (text.length < 30) {
+    const err = new Error('no text layer');
+    err.noText = true;
+    throw err;
+  }
+
+  const truncated = text.length > MAX_PDF_CHARS;
+  setChannelDoc(channelId, {
+    name: att.name,
+    pages,
+    text: truncated ? text.slice(0, MAX_PDF_CHARS) : text,
+  });
+
+  // ไม่ได้พิมพ์คำถามมา = โหมด "ตอบข้อสอบอัตโนมัติ": มีโจทย์ในไฟล์ -> ตอบทุกข้อแบบสั้น
+  // ไม่มีโจทย์ -> สรุปสั้นๆ  (พิมพ์คำถามมาเอง = ตอบตามที่พิมพ์)
+  const defaultTask =
+    'อ่านไฟล์นี้แล้วทำดังนี้: ถ้ามีคำถาม/โจทย์/ข้อสอบอยู่ในไฟล์ ให้ตอบทุกข้อเรียงตามข้อ ' +
+    'แบบสั้น กระชับ ตรงประเด็น (ปรนัย = คำตอบ + เหตุผล 1 ประโยค, อัตนัย = ตอบสั้นๆ ตรงประเด็น) ' +
+    'ใช้ภาษาเดียวกับที่โจทย์ใช้ ถ้าไม่มีคำถามเลย ให้สรุปสั้นๆ 3-5 บรรทัด';
+  pushHistory(
+    channelId,
+    'user',
+    `[แนบไฟล์ PDF: ${att.name}] ${question || defaultTask}`
+  );
+  const { answer, model } = await chatWithAI(
+    getHistory(channelId),
+    '',
+    getDocContext(channelId, MAX_PDF_CHARS)
+  );
+  pushHistory(channelId, 'assistant', answer);
+  return { answer, model, pages, truncated };
+}
+
 // ---------------- Discord: คำสั่ง (Slash Commands) ----------------
 
 const commands = [
@@ -285,6 +426,17 @@ const commands = [
         .setName('prompt')
         .setDescription('อธิบายรูปที่ต้องการ เช่น แมวทางานอยู่หน้าคอมพิวเตอร์')
         .setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName('pdf')
+    .setDescription('แนบไฟล์ PDF ให้บอทอ่าน สรุป หรือถาม-ตอบจากไฟล์')
+    .addAttachmentOption((o) =>
+      o.setName('file').setDescription('ไฟล์ PDF (ไม่เกิน 10MB)').setRequired(true)
+    )
+    .addStringOption((o) =>
+      o
+        .setName('question')
+        .setDescription('คำถามเกี่ยวกับไฟล์ (เว้นว่าง = สรุปเนื้อหาให้ฟัง)')
     ),
   new SlashCommandBuilder()
     .setName('model')
@@ -329,7 +481,11 @@ async function handleQuestion(channel, userText) {
   pushHistory(channel.id, 'user', userText);
   await channel.sendTyping();
   try {
-    const { answer, model } = await chatWithAI(getHistory(channel.id), '');
+    const { answer, model } = await chatWithAI(
+      getHistory(channel.id),
+      '',
+      getDocContext(channel.id)
+    );
     pushHistory(channel.id, 'assistant', answer);
     for (const chunk of splitMessage(answer)) {
       await channel.send(chunk);
@@ -377,10 +533,12 @@ client.on('interactionCreate', async (interaction) => {
           '`/ask` คำถาม:... — คุยกับ AI (จำบทสนทนาในห้องนี้)',
           '`/ask` คำถาม:... web: เปิด — ให้ค้นข้อมูลใหม่ ๆ จากอินเทอร์เน็ตก่อนตอบ',
           '`/image` คำบรรยาย — สร้างรูปภาพจากข้อความ',
+          '`/pdf` file: (แนบไฟล์) — ให้บอท**อ่านไฟล์ PDF** แล้วสรุป/ถาม-ตอบจากไฟล์',
           '`/model` — ดูรายการโมเดลฟรี + โมเดลที่กำลังใช้',
           '`/reset` — ล้างความจำบทสนทนาในห้องนี้',
           '',
           'หรือจะ **แท็กชื่อบอท** แล้วพิมพ์คำถามตรง ๆ ก็ได้ เช่น `@บอท สวัสดี ช่วยแปล...`',
+          'จะ **แนบไฟล์ PDF พร้อมแท็กบอท** (หรือส่ง DM) เช่น `@บอท สรุปไฟล์นี้` ก็อ่านให้ได้',
           'หรือส่งข้อความ **Direct Message** หาบอทก็ใช้ได้เหมือนกัน',
         ].join('\n')
       );
@@ -389,7 +547,8 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'reset') {
       clearHistory(interaction.channelId);
-      await interaction.reply('🧹 ล้างความจำบทสนทนาในห้องนี้เรียบร้อยแล้ว');
+      channelDocs.delete(interaction.channelId);
+      await interaction.reply('🧹 ล้างความจำบทสนทนา (และไฟล์ PDF ที่แนบไว้) ในห้องนี้เรียบร้อยแล้ว');
       return;
     }
 
@@ -443,6 +602,54 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'pdf') {
+      const file = interaction.options.getAttachment('file');
+      const question = interaction.options.getString('question') || '';
+
+      if (!isPdfAttachment(file)) {
+        await interaction.reply({
+          content:
+            '📄 กรุณาเลือกไฟล์ **.pdf** เท่านั้นนะ (กดที่ช่อง file แล้วเลือกไฟล์จากเครื่อง)',
+          ephemeral: true,
+        });
+        return;
+      }
+      if (isOnCooldown(interaction.user.id)) {
+        await interaction.reply({ content: '⏳ ช้าหน่อยนะ พิมพ์เร็วเกินไป', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+      try {
+        const { answer, model, pages, truncated } = await readAndAnswerPdf(
+          interaction.channelId,
+          file,
+          question
+        );
+        const header =
+          `📄 *อ่านไฟล์ **${file.name}** แล้ว (${pages} หน้า${truncated ? ' — ไฟล์ยาวมาก จึงใช้เนื้อหาส่วนต้น' : ''}) ตอบด้วย \`${model}\`*\n\n` +
+          `*ถามเรื่องไฟล์นี้ต่อได้ด้วย \`/ask\` — พิมพ์ \`/reset\` เพื่อให้ลืมไฟล์*\n\n`;
+        const full = header + answer;
+        if (full.length <= 1990) {
+          await interaction.editReply(full);
+        } else {
+          const chunks = splitMessage(full);
+          await interaction.editReply(chunks[0]);
+          for (const c of chunks.slice(1)) await interaction.channel.send(c);
+        }
+      } catch (err) {
+        console.error('[pdf]', err.message);
+        if (err.noText) {
+          await interaction.editReply(NO_TEXT_MSG);
+        } else {
+          await interaction.editReply(
+            '❌ อ่าน PDF ไม่สำเร็จ: ' + err.message.slice(0, 300)
+          );
+        }
+      }
+      return;
+    }
+
     if (interaction.commandName === 'ask') {
       const question = interaction.options.getString('question');
       const useWeb = interaction.options.getBoolean('web') || false;
@@ -468,10 +675,17 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       try {
-        const { answer, model } = await chatWithAI(getHistory(interaction.channelId), extraContext);
+        const docCtx = getDocContext(interaction.channelId);
+        const { answer, model } = await chatWithAI(
+          getHistory(interaction.channelId),
+          extraContext,
+          docCtx
+        );
         pushHistory(interaction.channelId, 'assistant', answer);
 
-        const header = useWeb ? `🔎 *ค้นเว็บแล้วตอบด้วย \`${model}\`*\n\n` : '';
+        const header =
+          (useWeb ? `🔎 *ค้นเว็บแล้วตอบด้วย \`${model}\`*\n\n` : '') +
+          (docCtx ? '📄 *ตอบโดยอ้างอิงไฟล์ PDF ที่แนบไว้ในห้องนี้ด้วย*\n\n' : '');
         const full = header + answer;
         if (full.length <= 1990) {
           await interaction.editReply(full);
@@ -510,6 +724,33 @@ client.on('messageCreate', async (msg) => {
     if (isOnCooldown(msg.author.id)) return;
 
     const text = msg.content.replace(/<@!?\d+>/g, '').trim();
+
+    // แนบไฟล์ PDF มาพร้อมแท็กบอท (หรือส่ง DM) — อ่านไฟล์ให้ทันที
+    const pdfAtt = msg.attachments.find((a) => isPdfAttachment(a));
+    if (pdfAtt) {
+      await msg.channel.sendTyping();
+      try {
+        const { answer, model, pages, truncated } = await readAndAnswerPdf(
+          msg.channel.id,
+          pdfAtt,
+          text
+        );
+        const header =
+          `📄 *อ่านไฟล์ **${pdfAtt.name}** แล้ว (${pages} หน้า${truncated ? ' — ไฟล์ยาวมาก จึงใช้เนื้อหาส่วนต้น' : ''}) ตอบด้วย \`${model}\`*\n\n`;
+        for (const chunk of splitMessage(header + answer)) {
+          await msg.channel.send(chunk);
+        }
+      } catch (err) {
+        console.error('[pdf]', err.message);
+        if (err.noText) {
+          await msg.reply(NO_TEXT_MSG);
+        } else {
+          await msg.reply('❌ อ่าน PDF ไม่สำเร็จ: ' + err.message.slice(0, 250));
+        }
+      }
+      return;
+    }
+
     if (!text) {
       await msg.reply('สวัสดี! พิมพ์คำถามมาได้เลย หรือใช้ `/help` ดูวิธีใช้');
       return;
