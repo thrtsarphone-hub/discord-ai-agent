@@ -5,7 +5,7 @@
  *  + ค้นเว็บฟรีผ่าน DuckDuckGo + อ่านไฟล์ PDF (สรุป/ถาม-ตอบจากเอกสาร)
  *
  *  รันได้บน Render.com free tier ตลอด 24 ชั่วโมง
- *  ต้องมีแค่ 2 ค่า: DISCORD_TOKEN และ OPENROUTER_API_KEY
+ *  ต้องมี DISCORD_TOKEN และ OPENROUTER_API_KEY; DATABASE_URL เป็นตัวเลือกสำหรับความจำถาวร
  * ============================================================
  */
 
@@ -19,9 +19,7 @@ const {
   SlashCommandBuilder,
 } = require('discord.js');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
+const { initDocumentStore, saveDocument, listDocuments, forgetDocuments, getDocContext } = require('./document-store');
 
 // ---------------- ตั้งค่าพื้นฐาน ----------------
 
@@ -55,8 +53,6 @@ const MAX_PDF_MB = 10; // ขนาดไฟล์ PDF สูงสุดที�
 const MAX_PDF_PAGES = 50; // อ่านสูงสุด 50 หน้าแรก (กันไฟล์ยักษ์กิน CPU ของเซิร์ฟเวอร์ฟรี)
 const MAX_PDF_CHARS = 12000; // จำกัดตัวอักษรที่ส่งให้โมเดล (ไฟล์ยาวมากจะใช้เนื้อหาส่วนต้น)
 const PDF_FOLLOWUP_CHARS = 6000; // เนื้อหาไฟล์ที่แนบไว้ ใช้ตอบคำถามต่อเนื่องด้วย /ask
-const FILE_MEMORY_PATH = process.env.FILE_MEMORY_PATH || path.join(__dirname, 'data', 'document-memory.json');
-const MAX_STORED_DOCUMENTS = 100;
 
 // ---------------- ความจำบทสนทนา (Memory) ----------------
 
@@ -77,93 +73,6 @@ function pushHistory(channelId, role, content) {
 function clearHistory(channelId) {
   memory.delete(channelId);
 }
-
-// ความจำเอกสารแบบถาวรในระดับโปรเซส/ไฟล์: แยกตามห้องและผู้ส่ง
-// หมายเหตุ: Render Free ไม่มี persistent disk; ใช้ FILE_MEMORY_PATH บน persistent disk
-// หรือย้าย storage ไปฐานข้อมูลภายนอกเมื่อต้องการให้ข้อมูลอยู่รอดหลัง deploy ใหม่
-const documentMemory = new Map(); // Map<documentId, {id, channelId, ownerId, name, pages, text, at}>
-
-function loadDocumentMemory() {
-  try {
-    if (!fs.existsSync(FILE_MEMORY_PATH)) return;
-    const items = JSON.parse(fs.readFileSync(FILE_MEMORY_PATH, 'utf8'));
-    if (Array.isArray(items)) {
-      for (const doc of items.slice(-MAX_STORED_DOCUMENTS)) {
-        if (doc && doc.id && doc.channelId && doc.ownerId && doc.name && doc.text) {
-          documentMemory.set(doc.id, doc);
-        }
-      }
-    }
-  } catch (err) {
-    console.error('[documents] load failed:', err.message);
-  }
-}
-
-function persistDocumentMemory() {
-  try {
-    const dir = path.dirname(FILE_MEMORY_PATH);
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = FILE_MEMORY_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify([...documentMemory.values()].slice(-MAX_STORED_DOCUMENTS)), 'utf8');
-    fs.renameSync(tmp, FILE_MEMORY_PATH);
-  } catch (err) {
-    console.error('[documents] save failed:', err.message);
-  }
-}
-
-function saveDocument(channelId, ownerId, doc) {
-  const id = crypto.createHash('sha256')
-    .update(`${channelId}:${ownerId}:${doc.name}:${doc.text}`)
-    .digest('hex')
-    .slice(0, 16);
-  documentMemory.set(id, { id, channelId, ownerId, ...doc, at: Date.now() });
-  while (documentMemory.size > MAX_STORED_DOCUMENTS) {
-    documentMemory.delete(documentMemory.keys().next().value);
-  }
-  persistDocumentMemory();
-  return id;
-}
-
-function listDocuments(channelId, ownerId) {
-  return [...documentMemory.values()]
-    .filter((doc) => doc.channelId === channelId && doc.ownerId === ownerId)
-    .sort((a, b) => b.at - a.at);
-}
-
-function forgetDocuments(channelId, ownerId, name) {
-  let removed = 0;
-  for (const [id, doc] of documentMemory) {
-    if (doc.channelId === channelId && doc.ownerId === ownerId &&
-        (!name || doc.name.toLowerCase() === name.toLowerCase())) {
-      documentMemory.delete(id);
-      removed++;
-    }
-  }
-  if (removed) persistDocumentMemory();
-  return removed;
-}
-
-function getDocContext(channelId, maxChars = PDF_FOLLOWUP_CHARS, question = '', ownerId = '') {
-  const docs = listDocuments(channelId, ownerId);
-  if (!docs.length) return '';
-  const terms = question.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((x) => x.length > 2);
-  const ranked = docs.map((doc) => ({
-    doc,
-    score: terms.reduce((n, term) => n + (doc.text.toLowerCase().includes(term) ? 1 : 0), 0),
-  })).sort((a, b) => b.score - a.score || b.doc.at - a.doc.at);
-  let used = 0;
-  const parts = [];
-  for (const { doc } of ranked) {
-    if (used >= maxChars) break;
-    const text = doc.text.slice(0, Math.min(doc.text.length, maxChars - used));
-    parts.push(`Document "${doc.name}" (${doc.pages} pages):\n---\n${text}\n---`);
-    used += text.length;
-  }
-  return `The user has authorized these documents for this channel. Answer only from them when relevant. ` +
-    `If the answer is not present, say so honestly and cite the document name.\n\n${parts.join('\n\n')}`;
-}
-
-loadDocumentMemory();
 
 // ---------------- ผู้ช่วยเล็ก ๆ ----------------
 
@@ -449,7 +358,7 @@ async function readAndAnswerPdf(channelId, ownerId, att, question) {
   }
 
   const truncated = text.length > MAX_PDF_CHARS;
-  const documentId = saveDocument(channelId, ownerId, {
+  const documentId = await saveDocument(channelId, ownerId, {
     name: att.name,
     pages,
     text: truncated ? text.slice(0, MAX_PDF_CHARS) : text,
@@ -469,7 +378,7 @@ async function readAndAnswerPdf(channelId, ownerId, att, question) {
   const { answer, model } = await chatWithAI(
     getHistory(channelId),
     '',
-    getDocContext(channelId, MAX_PDF_CHARS, question, ownerId)
+    await getDocContext(channelId, MAX_PDF_CHARS, question, ownerId)
   );
   pushHistory(channelId, 'assistant', answer);
   return { answer, model, pages, truncated, documentId };
@@ -564,7 +473,7 @@ async function handleQuestion(channel, ownerId, userText) {
     const { answer, model } = await chatWithAI(
       getHistory(channel.id),
       '',
-      getDocContext(channel.id, PDF_FOLLOWUP_CHARS, userText, ownerId)
+      await getDocContext(channel.id, PDF_FOLLOWUP_CHARS, userText, ownerId)
     );
     pushHistory(channel.id, 'assistant', answer);
     for (const chunk of splitMessage(answer)) {
@@ -634,7 +543,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'files') {
-      const docs = listDocuments(interaction.channelId, interaction.user.id);
+      const docs = await listDocuments(interaction.channelId, interaction.user.id);
       if (!docs.length) {
         await interaction.reply('📂 ตอนนี้ยังไม่มีไฟล์ที่บอทจำไว้สำหรับคุณในห้องนี้');
         return;
@@ -651,7 +560,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'forget') {
       const name = interaction.options.getString('file_name').trim();
-      const removed = forgetDocuments(interaction.channelId, interaction.user.id, name);
+      const removed = await forgetDocuments(interaction.channelId, interaction.user.id, name);
       await interaction.reply(removed
         ? `🗑️ ลบไฟล์ **${name}** ออกจากความจำถาวรแล้ว`
         : `ไม่พบไฟล์ชื่อ **${name}** ของคุณในห้องนี้`);
@@ -782,7 +691,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       try {
-        const docCtx = getDocContext(interaction.channelId, PDF_FOLLOWUP_CHARS, question, interaction.user.id);
+        const docCtx = await getDocContext(interaction.channelId, PDF_FOLLOWUP_CHARS, question, interaction.user.id);
         const { answer, model } = await chatWithAI(
           getHistory(interaction.channelId),
           extraContext,
@@ -897,7 +806,14 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-client.login(DISCORD_TOKEN).catch((err) => {
-  console.error('❌ login failed:', err.message);
-  process.exit(1);
-});
+async function startBot() {
+  try {
+    await initDocumentStore();
+    await client.login(DISCORD_TOKEN);
+  } catch (err) {
+    console.error('❌ startup failed:', err.message);
+    process.exit(1);
+  }
+}
+
+startBot();

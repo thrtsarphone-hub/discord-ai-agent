@@ -36,6 +36,7 @@
 2. ที่ render.com → New + → Blueprint → เลือก repo → Apply
    (ไฟล์ `render.yaml` จะตั้งค่าให้เอง)
 3. ไปที่ Environment ของ service แล้วใส่ `DISCORD_TOKEN` และ `OPENROUTER_API_KEY`
+   ถ้าต้องการให้ความจำไฟล์อยู่ถาวร ให้ใส่ `DATABASE_URL` จาก Supabase เพิ่มด้วย
    จากนั้นกด Save — บอทจะออนไลน์ภายใน 1-2 นาที
 4. เช็คหน้า Logs ว่ามีบรรทัด `[bot] logged in as ...` = สำเร็จ
 5. สร้าง monitor ฟรีที่ UptimeRobot กดเรียก URL `/health` ทุก 5 นาที
@@ -54,13 +55,26 @@ npm start
 > หมายเหตุ: `.env` ต้องตั้งค่าเอง เพราะโค้ดอ่านค่าจาก environment variables
 > (ถ้าอยากใช้ .env จริง ๆ ให้เพิ่ม `require('dotenv').config()` ต้นไฟล์ก่อน แล้ว `npm i dotenv`)
 
+## ตั้งค่าความจำไฟล์แบบถาวรด้วย Supabase
+
+1. สร้าง Project ฟรีที่ [supabase.com](https://supabase.com)
+2. เปิด `Project Settings → Database → Connection string` แล้วเลือก URI
+3. คัดลอกค่า URI ไปใส่ใน Render ที่ชื่อ `DATABASE_URL`
+4. กด Save และรอให้ Render deploy ใหม่
+
+เมื่อมี `DATABASE_URL` บอทจะสร้างตาราง `documents` และเก็บข้อมูล PDF ใน PostgreSQL อัตโนมัติ
+ถ้ายังไม่ใส่ค่า บอทจะใช้ไฟล์ JSON สำรองเหมือนเดิม
+
+**ห้ามใส่ `DATABASE_URL` ใน GitHub หรือส่งค่าในห้อง Discord** เพราะใน URI มีรหัสผ่านฐานข้อมูล
+
 ## ข้อจำกัดของแพ็กเกจฟรี
 
 - โมเดลฟรีของ OpenRouter มีโควตาจำกัดต่อวัน ถ้าเจอข้อความ rate limit ให้เปลี่ยนโมเดลด้วย `/model`
 - รูปจาก Pollinations อาจใช้เวลา 10-60 วินาทีต่อรูป
 - Render free tier อาจพักการทำงานถ้าไม่มีใครเรียก `/health` (แก้ด้วย UptimeRobot ตามขั้นตอนในคู่มือ)
 - ความจำบทสนทนาเก็บใน RAM — ถ้าบอทรีสตาร์ท ความจำจะเริ่มใหม่
-- คลังเอกสารใช้ไฟล์ JSON; บน Render Free อาจไม่อยู่รอดหลัง deploy ใหม่จนกว่าจะตั้ง persistent storage
+- ถ้าไม่ตั้ง `DATABASE_URL` คลังเอกสารใช้ไฟล์ JSON; บน Render Free อาจไม่อยู่รอดหลัง deploy ใหม่
+- ถ้าตั้ง `DATABASE_URL` แล้ว ข้อมูลเอกสารจะอยู่ใน PostgreSQL และอยู่รอดหลัง deploy ใหม่
 
 ## License
 

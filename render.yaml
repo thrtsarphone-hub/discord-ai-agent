@@ -17,3 +17,5 @@ services:
         sync: false
       - key: DEFAULT_MODEL
         sync: false
+      - key: DATABASE_URL
+        sync: false
