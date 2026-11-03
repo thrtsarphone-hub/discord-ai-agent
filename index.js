@@ -19,6 +19,9 @@ const {
   SlashCommandBuilder,
 } = require('discord.js');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
 // ---------------- ตั้งค่าพื้นฐาน ----------------
 
@@ -52,6 +55,8 @@ const MAX_PDF_MB = 10; // ขนาดไฟล์ PDF สูงสุดที�
 const MAX_PDF_PAGES = 50; // อ่านสูงสุด 50 หน้าแรก (กันไฟล์ยักษ์กิน CPU ของเซิร์ฟเวอร์ฟรี)
 const MAX_PDF_CHARS = 12000; // จำกัดตัวอักษรที่ส่งให้โมเดล (ไฟล์ยาวมากจะใช้เนื้อหาส่วนต้น)
 const PDF_FOLLOWUP_CHARS = 6000; // เนื้อหาไฟล์ที่แนบไว้ ใช้ตอบคำถามต่อเนื่องด้วย /ask
+const FILE_MEMORY_PATH = process.env.FILE_MEMORY_PATH || path.join(__dirname, 'data', 'document-memory.json');
+const MAX_STORED_DOCUMENTS = 100;
 
 // ---------------- ความจำบทสนทนา (Memory) ----------------
 
@@ -73,26 +78,92 @@ function clearHistory(channelId) {
   memory.delete(channelId);
 }
 
-// ความจำ "เอกสาร" แยกตามห้อง — จำไฟล์ PDF ล่าสุดของห้องนั้นไว้ให้ถามต่อได้
-// (เก็บแค่ไฟล์เดียว/ห้อง และจะหายถ้าพิมพ์ /reset หรือบอทรีสตาร์ท)
-const channelDocs = new Map(); // Map<channelId, {name, pages, text, at}>
+// ความจำเอกสารแบบถาวรในระดับโปรเซส/ไฟล์: แยกตามห้องและผู้ส่ง
+// หมายเหตุ: Render Free ไม่มี persistent disk; ใช้ FILE_MEMORY_PATH บน persistent disk
+// หรือย้าย storage ไปฐานข้อมูลภายนอกเมื่อต้องการให้ข้อมูลอยู่รอดหลัง deploy ใหม่
+const documentMemory = new Map(); // Map<documentId, {id, channelId, ownerId, name, pages, text, at}>
 
-function setChannelDoc(channelId, doc) {
-  channelDocs.set(channelId, { ...doc, at: Date.now() });
+function loadDocumentMemory() {
+  try {
+    if (!fs.existsSync(FILE_MEMORY_PATH)) return;
+    const items = JSON.parse(fs.readFileSync(FILE_MEMORY_PATH, 'utf8'));
+    if (Array.isArray(items)) {
+      for (const doc of items.slice(-MAX_STORED_DOCUMENTS)) {
+        if (doc && doc.id && doc.channelId && doc.ownerId && doc.name && doc.text) {
+          documentMemory.set(doc.id, doc);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[documents] load failed:', err.message);
+  }
 }
 
-function getDocContext(channelId, maxChars = PDF_FOLLOWUP_CHARS) {
-  const doc = channelDocs.get(channelId);
-  if (!doc) return '';
-  return (
-    `The user previously attached a PDF file "${doc.name}" (${doc.pages} pages) in this channel. ` +
-    `Here is its extracted text (may be truncated):\n---\n` +
-    doc.text.slice(0, maxChars) +
-    `\n---\nWhen the user asks about this document, answer from the text above. ` +
-    `If the answer is not in the document, say so honestly. ` +
-    `Keep answers brief and to the point.`
-  );
+function persistDocumentMemory() {
+  try {
+    const dir = path.dirname(FILE_MEMORY_PATH);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = FILE_MEMORY_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify([...documentMemory.values()].slice(-MAX_STORED_DOCUMENTS)), 'utf8');
+    fs.renameSync(tmp, FILE_MEMORY_PATH);
+  } catch (err) {
+    console.error('[documents] save failed:', err.message);
+  }
 }
+
+function saveDocument(channelId, ownerId, doc) {
+  const id = crypto.createHash('sha256')
+    .update(`${channelId}:${ownerId}:${doc.name}:${doc.text}`)
+    .digest('hex')
+    .slice(0, 16);
+  documentMemory.set(id, { id, channelId, ownerId, ...doc, at: Date.now() });
+  while (documentMemory.size > MAX_STORED_DOCUMENTS) {
+    documentMemory.delete(documentMemory.keys().next().value);
+  }
+  persistDocumentMemory();
+  return id;
+}
+
+function listDocuments(channelId, ownerId) {
+  return [...documentMemory.values()]
+    .filter((doc) => doc.channelId === channelId && doc.ownerId === ownerId)
+    .sort((a, b) => b.at - a.at);
+}
+
+function forgetDocuments(channelId, ownerId, name) {
+  let removed = 0;
+  for (const [id, doc] of documentMemory) {
+    if (doc.channelId === channelId && doc.ownerId === ownerId &&
+        (!name || doc.name.toLowerCase() === name.toLowerCase())) {
+      documentMemory.delete(id);
+      removed++;
+    }
+  }
+  if (removed) persistDocumentMemory();
+  return removed;
+}
+
+function getDocContext(channelId, maxChars = PDF_FOLLOWUP_CHARS, question = '', ownerId = '') {
+  const docs = listDocuments(channelId, ownerId);
+  if (!docs.length) return '';
+  const terms = question.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((x) => x.length > 2);
+  const ranked = docs.map((doc) => ({
+    doc,
+    score: terms.reduce((n, term) => n + (doc.text.toLowerCase().includes(term) ? 1 : 0), 0),
+  })).sort((a, b) => b.score - a.score || b.doc.at - a.doc.at);
+  let used = 0;
+  const parts = [];
+  for (const { doc } of ranked) {
+    if (used >= maxChars) break;
+    const text = doc.text.slice(0, Math.min(doc.text.length, maxChars - used));
+    parts.push(`Document "${doc.name}" (${doc.pages} pages):\n---\n${text}\n---`);
+    used += text.length;
+  }
+  return `The user has authorized these documents for this channel. Answer only from them when relevant. ` +
+    `If the answer is not present, say so honestly and cite the document name.\n\n${parts.join('\n\n')}`;
+}
+
+loadDocumentMemory();
 
 // ---------------- ผู้ช่วยเล็ก ๆ ----------------
 
@@ -369,7 +440,7 @@ async function extractPdfText(att) {
 }
 
 // อ่านไฟล์ -> เก็บลงความจำเอกสารของห้อง -> ถามโมเดล -> คืนคำตอบ
-async function readAndAnswerPdf(channelId, att, question) {
+async function readAndAnswerPdf(channelId, ownerId, att, question) {
   const { pages, text } = await extractPdfText(att);
   if (text.length < 30) {
     const err = new Error('no text layer');
@@ -378,7 +449,7 @@ async function readAndAnswerPdf(channelId, att, question) {
   }
 
   const truncated = text.length > MAX_PDF_CHARS;
-  setChannelDoc(channelId, {
+  const documentId = saveDocument(channelId, ownerId, {
     name: att.name,
     pages,
     text: truncated ? text.slice(0, MAX_PDF_CHARS) : text,
@@ -398,10 +469,10 @@ async function readAndAnswerPdf(channelId, att, question) {
   const { answer, model } = await chatWithAI(
     getHistory(channelId),
     '',
-    getDocContext(channelId, MAX_PDF_CHARS)
+    getDocContext(channelId, MAX_PDF_CHARS, question, ownerId)
   );
   pushHistory(channelId, 'assistant', answer);
-  return { answer, model, pages, truncated };
+  return { answer, model, pages, truncated, documentId };
 }
 
 // ---------------- Discord: คำสั่ง (Slash Commands) ----------------
@@ -448,7 +519,16 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName('reset')
-    .setDescription('ล้างความจำบทสนทนาในห้องนี้'),
+    .setDescription('ล้างความจำบทสนทนาในห้องนี้ (ไม่ลบคลังเอกสาร)'),
+  new SlashCommandBuilder()
+    .setName('files')
+    .setDescription('ดูรายการไฟล์ที่บอทจำไว้สำหรับคุณในห้องนี้'),
+  new SlashCommandBuilder()
+    .setName('forget')
+    .setDescription('ลืมไฟล์ของคุณในห้องนี้')
+    .addStringOption((o) =>
+      o.setName('file_name').setDescription('ชื่อไฟล์ตรงตามรายการจาก /files').setRequired(true)
+    ),
   new SlashCommandBuilder()
     .setName('help')
     .setDescription('วิธีใช้บอท'),
@@ -477,14 +557,14 @@ async function registerCommands(client) {
 
 // ---------------- Discord: ตัวจัดการคำถาม (สำหรับการแท็กบอท) ----------------
 
-async function handleQuestion(channel, userText) {
+async function handleQuestion(channel, ownerId, userText) {
   pushHistory(channel.id, 'user', userText);
   await channel.sendTyping();
   try {
     const { answer, model } = await chatWithAI(
       getHistory(channel.id),
       '',
-      getDocContext(channel.id)
+      getDocContext(channel.id, PDF_FOLLOWUP_CHARS, userText, ownerId)
     );
     pushHistory(channel.id, 'assistant', answer);
     for (const chunk of splitMessage(answer)) {
@@ -534,8 +614,10 @@ client.on('interactionCreate', async (interaction) => {
           '`/ask` คำถาม:... web: เปิด — ให้ค้นข้อมูลใหม่ ๆ จากอินเทอร์เน็ตก่อนตอบ',
           '`/image` คำบรรยาย — สร้างรูปภาพจากข้อความ',
           '`/pdf` file: (แนบไฟล์) — ให้บอท**อ่านไฟล์ PDF** แล้วสรุป/ถาม-ตอบจากไฟล์',
+          '`/files` — ดูไฟล์ที่บอทจำไว้สำหรับคุณในห้องนี้',
+          '`/forget` file_name:... — ลบไฟล์ของคุณออกจากความจำถาวร',
           '`/model` — ดูรายการโมเดลฟรี + โมเดลที่กำลังใช้',
-          '`/reset` — ล้างความจำบทสนทนาในห้องนี้',
+          '`/reset` — ล้างความจำบทสนทนาในห้องนี้ (ไม่ลบไฟล์)',
           '',
           'หรือจะ **แท็กชื่อบอท** แล้วพิมพ์คำถามตรง ๆ ก็ได้ เช่น `@บอท สวัสดี ช่วยแปล...`',
           'จะ **แนบไฟล์ PDF พร้อมแท็กบอท** (หรือส่ง DM) เช่น `@บอท สรุปไฟล์นี้` ก็อ่านให้ได้',
@@ -547,8 +629,32 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'reset') {
       clearHistory(interaction.channelId);
-      channelDocs.delete(interaction.channelId);
-      await interaction.reply('🧹 ล้างความจำบทสนทนา (และไฟล์ PDF ที่แนบไว้) ในห้องนี้เรียบร้อยแล้ว');
+      await interaction.reply('🧹 ล้างความจำบทสนทนาในห้องนี้แล้ว — ไฟล์ยังอยู่ในคลัง ใช้ `/forget` หากต้องการลบไฟล์');
+      return;
+    }
+
+    if (interaction.commandName === 'files') {
+      const docs = listDocuments(interaction.channelId, interaction.user.id);
+      if (!docs.length) {
+        await interaction.reply('📂 ตอนนี้ยังไม่มีไฟล์ที่บอทจำไว้สำหรับคุณในห้องนี้');
+        return;
+      }
+      const lines = docs.map((doc, i) => `${i + 1}. **${doc.name}** — ${doc.pages} หน้า`);
+      await interaction.reply([
+        '📂 **ไฟล์ที่บอทจำไว้สำหรับคุณในห้องนี้**',
+        ...lines,
+        '',
+        'ถามข้อมูลด้วย `/ask` ได้เลย หรือใช้ `/forget` file_name เพื่อลบไฟล์',
+      ].join('\n'));
+      return;
+    }
+
+    if (interaction.commandName === 'forget') {
+      const name = interaction.options.getString('file_name').trim();
+      const removed = forgetDocuments(interaction.channelId, interaction.user.id, name);
+      await interaction.reply(removed
+        ? `🗑️ ลบไฟล์ **${name}** ออกจากความจำถาวรแล้ว`
+        : `ไม่พบไฟล์ชื่อ **${name}** ของคุณในห้องนี้`);
       return;
     }
 
@@ -623,12 +729,13 @@ client.on('interactionCreate', async (interaction) => {
       try {
         const { answer, model, pages, truncated } = await readAndAnswerPdf(
           interaction.channelId,
+          interaction.user.id,
           file,
           question
         );
         const header =
           `📄 *อ่านไฟล์ **${file.name}** แล้ว (${pages} หน้า${truncated ? ' — ไฟล์ยาวมาก จึงใช้เนื้อหาส่วนต้น' : ''}) ตอบด้วย \`${model}\`*\n\n` +
-          `*ถามเรื่องไฟล์นี้ต่อได้ด้วย \`/ask\` — พิมพ์ \`/reset\` เพื่อให้ลืมไฟล์*\n\n`;
+          `*ถามเรื่องไฟล์นี้ต่อได้ด้วย \`/ask\` — ใช้ \`/files\` และ \`/forget\` เพื่อจัดการไฟล์*\n\n`;
         const full = header + answer;
         if (full.length <= 1990) {
           await interaction.editReply(full);
@@ -675,7 +782,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       try {
-        const docCtx = getDocContext(interaction.channelId);
+        const docCtx = getDocContext(interaction.channelId, PDF_FOLLOWUP_CHARS, question, interaction.user.id);
         const { answer, model } = await chatWithAI(
           getHistory(interaction.channelId),
           extraContext,
@@ -732,6 +839,7 @@ client.on('messageCreate', async (msg) => {
       try {
         const { answer, model, pages, truncated } = await readAndAnswerPdf(
           msg.channel.id,
+          msg.author.id,
           pdfAtt,
           text
         );
@@ -756,7 +864,7 @@ client.on('messageCreate', async (msg) => {
       return;
     }
 
-    await handleQuestion(msg.channel, text);
+    await handleQuestion(msg.channel, msg.author.id, text);
   } catch (err) {
     console.error('[messageCreate]', err);
   }
