@@ -1,13 +1,10 @@
-# Render.com Blueprint — deploy อัตโนมัติทั้งโปรเจกต์ในคลิกเดียว
-# หลัง deploy ให้เข้า Environment แล้วใส่ DISCORD_TOKEN และ OPENROUTER_API_KEY
-# ดูขั้นตอนละเอียดในคู่มือ PDF ที่ได้มาพร้อมโปรเจกต์นี้
-
 services:
   - type: web
     name: discord-ai-agent
     runtime: node
-    plan: free
-    buildCommand: npm install
+    plan: starter
+    region: oregon
+    buildCommand: npm ci
     startCommand: node index.js
     healthCheckPath: /health
     envVars:
@@ -15,7 +12,14 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: CLIENT_ID
+        value: 1567044332664520744
+      - key: GUILD_ID
+        value: 1567043769860104322
+      - key: OWNER_ID
+        value: 670550091953733632
       - key: DEFAULT_MODEL
-        sync: false
+        value: openrouter/auto
       - key: DATABASE_URL
         sync: false
+    autoDeploy: true

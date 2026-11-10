@@ -1,152 +1,164 @@
+'use strict';
+
+// Document memory: PostgreSQL when DATABASE_URL exists (Render), JSON file otherwise.
+// Preserves the original bot's document/PDF memory behavior: /pdf /files /forget.
+
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const config = require('./config');
+const stats = require('./stats');
 
-const FILE_MEMORY_PATH = process.env.FILE_MEMORY_PATH || path.join(__dirname, 'data', 'document-memory.json');
-const MAX_STORED_DOCUMENTS = 100;
-const DATABASE_URL = process.env.DATABASE_URL;
-const documents = new Map();
-const db = DATABASE_URL
-  ? new (require('pg').Pool)({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-      max: 5,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    })
-  : null;
+let mode = 'json';
+let pool = null;
 
-function loadLocal() {
+const jsonFile = () => path.join(config.dataDir, 'documents.json');
+
+function jsonRead() {
   try {
-    if (!fs.existsSync(FILE_MEMORY_PATH)) return;
-    const items = JSON.parse(fs.readFileSync(FILE_MEMORY_PATH, 'utf8'));
-    if (Array.isArray(items)) {
-      for (const doc of items.slice(-MAX_STORED_DOCUMENTS)) {
-        if (doc?.id && doc.channelId && doc.ownerId && doc.name && doc.text) documents.set(doc.id, doc);
-      }
+    return JSON.parse(fs.readFileSync(jsonFile(), 'utf8'));
+  } catch (e) {
+    return [];
+  }
+}
+
+function jsonWrite(arr) {
+  fs.mkdirSync(config.dataDir, { recursive: true });
+  const tmp = `${jsonFile()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(arr));
+  fs.renameSync(tmp, jsonFile());
+}
+
+async function initStore() {
+  if (config.databaseUrl) {
+    try {
+      const { Pool } = require('pg');
+      const ssl = /localhost|127\.0\.0\.1/.test(config.databaseUrl) ? false : { rejectUnauthorized: false };
+      pool = new Pool({ connectionString: config.databaseUrl, max: 4, ssl });
+      await pool.query(`CREATE TABLE IF NOT EXISTS documents (
+        id SERIAL PRIMARY KEY,
+        guild_id TEXT NOT NULL DEFAULT '',
+        channel_id TEXT NOT NULL DEFAULT '',
+        file_name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (guild_id, channel_id, file_name)
+      )`);
+      mode = 'pg';
+      console.log('[store] PostgreSQL document store ready');
+    } catch (err) {
+      console.error('[store] DB unavailable, using JSON fallback:', err.message || err.code || 'unknown error');
+      try { if (pool) await pool.end(); } catch (e) { /* ignore */ }
+      pool = null;
+      mode = 'json';
     }
-  } catch (err) {
-    console.error('[documents] local load failed:', err.message);
   }
+  fs.mkdirSync(config.dataDir, { recursive: true });
+  return mode;
 }
 
-function persistLocal() {
-  try {
-    fs.mkdirSync(path.dirname(FILE_MEMORY_PATH), { recursive: true });
-    const tmp = FILE_MEMORY_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify([...documents.values()].slice(-MAX_STORED_DOCUMENTS)), 'utf8');
-    fs.renameSync(tmp, FILE_MEMORY_PATH);
-  } catch (err) {
-    console.error('[documents] local save failed:', err.message);
-  }
-}
-
-async function initDocumentStore() {
-  loadLocal();
-  const localDocuments = [...documents.values()];
-  if (!db) {
-    console.warn('[documents] DATABASE_URL missing; using local JSON fallback');
-    return;
-  }
-  await db.query(`
-    create table if not exists documents (
-      id text primary key,
-      channel_id text not null,
-      owner_id text not null,
-      file_name text not null,
-      page_count integer not null default 0,
-      content text not null,
-      file_hash text not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
+async function saveDocument({ guildId = '', channelId = '', fileName, content }) {
+  stats.inc('documentsStored');
+  if (mode === 'pg') {
+    await pool.query(
+      `INSERT INTO documents (guild_id, channel_id, file_name, content, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (guild_id, channel_id, file_name)
+       DO UPDATE SET content = EXCLUDED.content, created_at = NOW()`,
+      [String(guildId), String(channelId), String(fileName), String(content)]
     );
-    create index if not exists documents_owner_channel_idx on documents(owner_id, channel_id);
-    create index if not exists documents_file_hash_idx on documents(file_hash);
-  `);
-  for (const doc of localDocuments) {
-    const fileHash = crypto.createHash('sha256')
-      .update(`${doc.channelId}:${doc.ownerId}:${doc.name}:${doc.text}`)
-      .digest('hex');
-    await db.query(`
-      insert into documents (id, channel_id, owner_id, file_name, page_count, content, file_hash, created_at, updated_at)
-      values ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8 / 1000.0), now())
-      on conflict (id) do nothing
-    `, [doc.id, doc.channelId, doc.ownerId, doc.name, doc.pages, doc.text, fileHash, doc.at || Date.now()]);
+    return true;
   }
-  const result = await db.query(`
-    select id, channel_id as "channelId", owner_id as "ownerId",
-           file_name as name, page_count as pages, content as text,
-           extract(epoch from created_at) * 1000 as at
-    from documents order by created_at desc limit $1
-  `, [MAX_STORED_DOCUMENTS]);
-  documents.clear();
-  for (const doc of result.rows) documents.set(doc.id, doc);
-  console.log(`[documents] PostgreSQL connected; loaded ${result.rows.length} documents`);
+  const arr = jsonRead();
+  const key = (doc) => doc.guildId === String(guildId) && doc.channelId === String(channelId) && doc.fileName === String(fileName);
+  const existing = arr.findIndex(key);
+  const rec = {
+    guildId: String(guildId),
+    channelId: String(channelId),
+    fileName: String(fileName),
+    content: String(content),
+    createdAt: Date.now(),
+  };
+  if (existing >= 0) arr[existing] = rec;
+  else arr.push(rec);
+  jsonWrite(arr);
+  return true;
 }
 
-async function saveDocument(channelId, ownerId, doc) {
-  const fileHash = crypto.createHash('sha256')
-    .update(`${channelId}:${ownerId}:${doc.name}:${doc.text}`)
-    .digest('hex');
-  const id = fileHash.slice(0, 16);
-  const record = { id, channelId, ownerId, ...doc, at: Date.now() };
-  documents.set(id, record);
-  while (documents.size > MAX_STORED_DOCUMENTS) documents.delete(documents.keys().next().value);
-  if (db) {
-    await db.query(`
-      insert into documents (id, channel_id, owner_id, file_name, page_count, content, file_hash, updated_at)
-      values ($1, $2, $3, $4, $5, $6, $7, now())
-      on conflict (id) do update set file_name = excluded.file_name,
-        page_count = excluded.page_count, content = excluded.content,
-        file_hash = excluded.file_hash, updated_at = now()
-    `, [id, channelId, ownerId, doc.name, doc.pages, doc.text, fileHash]);
-  } else {
-    persistLocal();
-  }
-  return id;
-}
-
-async function listDocuments(channelId, ownerId) {
-  return [...documents.values()]
-    .filter((doc) => doc.channelId === channelId && doc.ownerId === ownerId)
-    .sort((a, b) => b.at - a.at);
-}
-
-async function forgetDocuments(channelId, ownerId, name) {
-  const matching = [...documents.values()].filter((doc) =>
-    doc.channelId === channelId && doc.ownerId === ownerId && doc.name.toLowerCase() === name.toLowerCase()
-  );
-  if (db) {
-    const result = await db.query(
-      'delete from documents where channel_id = $1 and owner_id = $2 and lower(file_name) = lower($3)',
-      [channelId, ownerId, name]
+async function listDocuments(guildId = '') {
+  if (mode === 'pg') {
+    const res = await pool.query(
+      `SELECT file_name, channel_id, LENGTH(content) AS chars, created_at
+       FROM documents WHERE guild_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [String(guildId)]
     );
-    for (const doc of matching) documents.delete(doc.id);
-    return result.rowCount;
+    return res.rows.map((r) => ({
+      fileName: r.file_name,
+      channelId: r.channel_id,
+      chars: Number(r.chars),
+      createdAt: r.created_at,
+    }));
   }
-  for (const doc of matching) documents.delete(doc.id);
-  if (matching.length) persistLocal();
-  return matching.length;
+  return jsonRead()
+    .filter((d) => !guildId || d.guildId === String(guildId))
+    .slice()
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .map((d) => ({ fileName: d.fileName, channelId: d.channelId, chars: (d.content || '').length, createdAt: d.createdAt }));
 }
 
-async function getDocContext(channelId, maxChars, question, ownerId) {
-  const docs = await listDocuments(channelId, ownerId);
-  if (!docs.length) return '';
-  const terms = question.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((x) => x.length > 2);
-  const ranked = docs.map((doc) => ({
-    doc,
-    score: terms.reduce((n, term) => n + (doc.text.toLowerCase().includes(term) ? 1 : 0), 0),
-  })).sort((a, b) => b.score - a.score || b.doc.at - a.doc.at);
-  let used = 0;
-  const parts = [];
-  for (const { doc } of ranked) {
-    if (used >= maxChars) break;
-    const text = doc.text.slice(0, Math.min(doc.text.length, maxChars - used));
-    parts.push(`Document "${doc.name}" (${doc.pages} pages):\n---\n${text}\n---`);
-    used += text.length;
+async function deleteDocument(fileName, guildId = '') {
+  if (mode === 'pg') {
+    const res = await pool.query(
+      `DELETE FROM documents WHERE guild_id = $1 AND file_name = $2`,
+      [String(guildId), String(fileName)]
+    );
+    return (res.rowCount || 0) > 0;
   }
-  return `The user has authorized these documents for this channel. Answer only from them when relevant. ` +
-    `If the answer is not present, say so honestly and cite the document name.\n\n${parts.join('\n\n')}`;
+  const arr = jsonRead();
+  const idx = arr.findIndex((d) => (!guildId || d.guildId === String(guildId)) && d.fileName === String(fileName));
+  if (idx < 0) return false;
+  arr.splice(idx, 1);
+  jsonWrite(arr);
+  return true;
 }
 
-module.exports = { initDocumentStore, saveDocument, listDocuments, forgetDocuments, getDocContext };
+// Tiny keyword-overlap retrieval so agents get grounded context from stored docs.
+async function relevantDocuments(query, guildId = '', channelId = '', limit = 2) {
+  const tokens = String(query || '')
+    .toLowerCase()
+    .split(/[^a-z0-9ก-๙]+/)
+    .filter((t) => t.length >= 2);
+  if (!tokens.length) return [];
+  const all = await listDocuments(guildId);
+  const scored = [];
+  for (const doc of all) {
+    // Prefer same channel, but keep other-channel docs in the same guild as candidates.
+    const content = await getDocumentContent(doc, guildId);
+    if (!content) continue;
+    const lc = content.toLowerCase();
+    let score = 0;
+    for (const t of tokens) if (lc.includes(t)) score += 1;
+    if (score <= 0) continue;
+    if (channelId && doc.channelId === String(channelId)) score += 0.5;
+    scored.push({ doc, score, content });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((s) => ({
+    fileName: s.doc.fileName,
+    excerpt: s.content.slice(0, 2500),
+    chars: s.doc.chars,
+  }));
+}
+
+async function getDocumentContent(docMeta, guildId = '') {
+  if (mode === 'pg') {
+    const res = await pool.query(
+      `SELECT content FROM documents WHERE guild_id = $1 AND file_name = $2 LIMIT 1`,
+      [String(guildId), String(docMeta.fileName)]
+    );
+    return res.rows.length ? res.rows[0].content : null;
+  }
+  const rec = jsonRead().find((d) => (!guildId || d.guildId === String(guildId)) && d.fileName === String(docMeta.fileName));
+  return rec ? rec.content : null;
+}
+
+module.exports = { initStore, saveDocument, listDocuments, deleteDocument, relevantDocuments, storeMode: () => mode };

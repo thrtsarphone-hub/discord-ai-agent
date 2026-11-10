@@ -1,18 +1,23 @@
 {
   "name": "discord-ai-agent",
-  "version": "1.2.0",
-  "description": "Discord AI Agent with free AI models (OpenRouter), free image generation (Pollinations), free web search (DuckDuckGo) and PDF reading. Runs 24/7 free on Render.com",
+  "version": "2.0.0",
+  "description": "Discord AI Agent — one Gateway connection, multi-agent workflow (Supervisor -> Research + Data Analysis -> Reviewer -> Synthesis) with multiple LLM models via OpenRouter",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test/run-tests.js",
+    "simulate": "node scripts/simulate-ask.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "discord.js": "^14.16.3",
-    "pdfjs-dist": "3.11.174",
-    "pg": "^8.13.1"
+    "discord.js": "^14.28.1",
+    "pdfjs-dist": "^4.10.38",
+    "pg": "^8.23.1"
+  },
+  "optionalDependencies": {
+    "z-ai-web-dev-sdk": "^0.0.18"
   },
   "license": "MIT"
 }

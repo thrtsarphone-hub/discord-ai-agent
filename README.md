@@ -1,81 +1,86 @@
-# Discord AI Agent (Hermes-Lite)
+# Discord AI Agent — Multi-Agent System
 
-บอท AI Agent สำหรับ Discord ที่ใช้ได้ฟรี ตั้งค่าครั้งเดียว ทำงาน 24 ชม. จาก iPhone ล้วน ๆ
+บอท Discord หนึ่งตัว (หนึ่ง Gateway connection) ที่มี **ทีม AI หลายโมเดล** ทำงานร่วมกันอัตโนมัติ พร้อมความจำเอกสาร PDF, ความจำการสนทนารายช่อง, ค้นเว็บ และสร้างภาพ
 
-## ความสามารถ
+## สถาปัตยกรรม
 
-| คำสั่ง | ทำอะไร |
+```
+Discord Gateway (discord.js — 1 connection)
+   └─ /ask (คำถามซับซ้อน หรือ workflow: true)
+        🧠 Supervisor  — วิเคราะห์คำถาม วางแผนงาน
+             ├─ 🔍 Research Agent (โมเดล A)      ┐ ทำงานคู่ขนาน (Promise.all)
+             └─ 📊 Data Analysis Agent (โมเดล B)  ┘
+        🧐 Reviewer (โมเดล C) — ตรวจ conflict / ข้อมูลผิด / คำถามที่ยังไม่ตอบ
+        🧠 Supervisor — รวมเป็นคำตอบเดียว → 1 ข้อความใน Discord
+```
+
+- **หนึ่ง Gateway หลายโมเดลได้**: ทุก agent เรียกผ่าน adapter เดียว (`src/providers.js`) ไปที่ OpenRouter — เลือกโมเดลต่างกันต่อ agent ด้วย env
+- Worker agent **ไม่เขียนข้อความลง Discord เอง** — มีแต่ orchestrator ที่ส่งคำตอบสุดท้ายเดียว
+- ทุก agent call มี timeout / token cap / budget guard และ **fallback**: agent ใดล้ม ระบบยังตอบได้ (ไม่เกิด "Application did not respond")
+- `/ask` คำถามเรียบง่าย = ตอบตรง (โมเดลเดียวเร็ว ๆ) · คำถามซับซ้อน = ทีมอัตโนมัติ (วิเคราะห์ด้วย heuristic: ความยาว + คำสำคัญ วิเคราะห์/เปรียบเทียบ/แผน/ความเสี่ยง ฯลฯ) · บังคับทีมด้วย `workflow: true`
+
+## คำสั่ง
+
+| คำสั่ง | คำอธิบาย |
 |---|---|
-| `/ask` คำถาม | คุยกับ AI โดยจำบทสนทนาในห้องนั้นได้ 20 ตอนล่าสุด |
-| `/ask` + web: เปิด | ค้นข้อมูล/ข่าวจากอินเทอร์เน็ต (DuckDuckGo) ก่อนตอบ พร้อมแหล่งอ้างอิง |
-| `/image` คำบรรยาย | สร้างรูปภาพจากข้อความ (Pollinations ฟรี ไม่ต้องสมัคร) |
-| `/model` | ดูรายการโมเดลฟรีล่าสุดจาก OpenRouter + เปลี่ยนโมเดล |
-| `/reset` | ล้างความจำบทสนทนาในห้อง |
-| `/files` | ดูรายการ PDF ที่บอทจำไว้สำหรับคุณในห้องนั้น |
-| `/forget` | ลบ PDF ของคุณออกจากคลังความจำถาวร |
-| `/help` | ดูวิธีใช้ทั้งหมด |
+| `/ask question [web] [workflow]` | ถามอะไรก็ได้ — ซับซ้อน = ทีม Multi-Agent อัตโนมัติ |
+| `/research topic` | Research Agent ค้นเว็บ + สรุปพร้อมแหล่งอ้างอิง |
+| `/analyze request` | Data Analysis Agent วิเคราะห์แบบมีโครงสร้าง |
+| `/pdf file [question]` | ให้บอทจำ PDF (Postgres/JSON) แล้วถาม-ตอบได้ |
+| `/files` · `/forget file_name` | ดู/ลบเอกสารที่จำ |
+| `/image prompt` | สร้างภาพ (Pollinations) |
+| `/reset` | ล้างความจำการสนทนาของช่องนั้น |
+| `/status` | สถานะระบบ, โมเดลราย agent, สถิติการทำงาน |
+| `/model [model_id]` | ดู/ตั้งโมเดลหลัก (เจ้าของเซิร์ฟเวอร์เท่านั้น) |
+| `/help` | คำแนะนำการใช้งานใน Discord |
 
-บอทจะเก็บข้อความจาก PDF ที่คุณอัปโหลดไว้ในคลังเอกสารแยกตาม Discord user และห้อง
-เพื่อให้ถามต่อด้วย `/ask` ได้ภายหลัง โดยจะไม่เปิดเอกสารของผู้ใช้คนหนึ่งให้ผู้ใช้อื่นในห้องเดียวกัน
+## ตัวแปร environment
 
-> **การเก็บข้อมูลบน Render Free:** ระบบใช้ไฟล์ JSON ตามค่า `FILE_MEMORY_PATH`
-> (ค่าเริ่มต้นคือ `data/document-memory.json`) แต่ Render Free อาจลบไฟล์เมื่อมีการ deploy/restart ใหม่
-> หากต้องการให้ความจำอยู่ถาวรควรใช้ persistent disk หรือฐานข้อมูลภายนอกในขั้นถัดไป
+| ตัวแปร | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|
+| `DISCORD_TOKEN` | — | **จำเป็น** (รองรับ `DISCORD_BOT_TOKEN` ด้วย) |
+| `OPENROUTER_API_KEY` | — | คีย์ OpenRouter — ใช้หลายโมเดลในคีย์เดียว (production) |
+| `PROVIDER` | auto | `openrouter` \| `zai` \| `mock` |
+| `DEFAULT_MODEL` | `openrouter/auto` | โมเดลหลักของ agent ที่ไม่ได้ระบุเอง |
+| `SUPERVISOR_MODEL` `RESEARCH_MODEL` `ANALYSIS_MODEL` `REVIEWER_MODEL` | ตาม DEFAULT | ตั้งต่างกันเพื่อ "หลายโมเดลร่วมทีม" เช่น `RESEARCH_MODEL=perplexity/sonar` (มี web search ในตัว) |
+| `SEARCH_PROVIDER` | auto | `zai` \| `html` (Bing→DDG) \| `off` |
+| `DATABASE_URL` | — | Postgres (Render) — ไม่มีก็ใช้ไฟล์ JSON ใน `DATA_DIR` |
+| `AGENT_TIMEOUT_MS` / `MAX_AGENT_TOKENS` / `MAX_WORKFLOW_CALLS` | 45000 / 1200 / 7 | ตัวกันงานค้างและงานบานพุ่ง |
+| `GUILD_ID` `OWNER_ID` `CLIENT_ID` | — | ใช้ลงคำสั่งแบบ guild (instant) และตรวจสิทธิ์เจ้าของ |
+| `NOTIFY_CHANNEL_ID` | — | ส่งข้อความ "ออนไลน์" เมื่อบอทพร้อม |
 
-นอกจาก slash command ยังแท็ก `@บอท คำถาม` หรือ Direct Message หาบอทได้เลย
+รายการโมเดลที่ใช้ได้: <https://openrouter.ai/models> (เช่น `openai/gpt-4o-mini`, `perplexity/sonar`, `deepseek/deepseek-chat`, `openrouter/auto`)
 
-## สิ่งที่ต้องมี
-
-1. **DISCORD_TOKEN** — จาก https://discord.com/developers/applications
-2. **OPENROUTER_API_KEY** — จาก https://openrouter.ai/keys (มีโมเดลฟรีให้ใช้)
-3. บัญชี GitHub + Render.com (deploy ฟรี)
-
-## Deploy บน Render (ไม่ต้องมีคอม ใช้ iPhone ได้)
-
-1. อัปโหลดไฟล์ทั้งหมดของโปรเจกต์นี้ไป GitHub repository ของคุณ (public)
-2. ที่ render.com → New + → Blueprint → เลือก repo → Apply
-   (ไฟล์ `render.yaml` จะตั้งค่าให้เอง)
-3. ไปที่ Environment ของ service แล้วใส่ `DISCORD_TOKEN` และ `OPENROUTER_API_KEY`
-   ถ้าต้องการให้ความจำไฟล์อยู่ถาวร ให้ใส่ `DATABASE_URL` จาก Supabase เพิ่มด้วย
-   จากนั้นกด Save — บอทจะออนไลน์ภายใน 1-2 นาที
-4. เช็คหน้า Logs ว่ามีบรรทัด `[bot] logged in as ...` = สำเร็จ
-5. สร้าง monitor ฟรีที่ UptimeRobot กดเรียก URL `/health` ทุก 5 นาที
-   เพื่อไม่ให้ Render พักการทำงานของบอท
-
-ดูขั้นตอนละเอียดแบบมือใหม่ทุกปุ่ม ในไฟล์คู่มือ PDF ภาษาไทยที่แถมมาให้
-
-## รันในเครื่องเอง (ถ้ามีคอม)
+## รันทดสอบในเครื่อง
 
 ```bash
 npm install
-cp env.example .env   # แล้วแก้ค่า token/key ในไฟล์ .env
-npm start
+npm test              # 14 unit/e2e tests (mock provider — ไม่ใช้ network)
+npm run simulate      # ทดสอบ /ask ทีม Multi-Agent แบบเต็มรูปแบบ (LLM จริง + ค้นเว็บจริง)
+DISCORD_TOKEN=... node index.js   # รันบอทจริง
 ```
 
-> หมายเหตุ: `.env` ต้องตั้งค่าเอง เพราะโค้ดอ่านค่าจาก environment variables
-> (ถ้าอยากใช้ .env จริง ๆ ให้เพิ่ม `require('dotenv').config()` ต้นไฟล์ก่อน แล้ว `npm i dotenv`)
+## ความปลอดภัย
 
-## ตั้งค่าความจำไฟล์แบบถาวรด้วย Supabase
+- ใช้ **Bot API + Gateway ทางการ** เท่านั้น (ไม่ใช่ self-bot) — slash commands ทั้งหมด
+- **ยังไม่มีคำสั่งทำลาย Discord** (ลบข้อความ/แก้ role/จัดการสมาชิก) — เมื่อจะเพิ่ม ต้องผ่านประตูอนุมัติเจ้าของ (`src/safety.js`)
+- ไม่ log token / API key / interaction token หรือเนื้อหาเอกสารเต็ม ๆ ลง console
+- **ห้ามตั้ง "Interactions Endpoint URL" ใน Discord Developer Portal** — บอทใช้ Gateway ของ discord.js; เซิร์ฟเวอร์ HTTP มีไว้เพื่อ health check ของ Render (`/health`) เท่านั้น
+- `.env.example` เป็นเทมเพลต — อย่า commit ค่าจริง (`DATABASE_URL`, token, key อยู่ใน Render Environment)
 
-1. สร้าง Project ฟรีที่ [supabase.com](https://supabase.com)
-2. เปิด `Project Settings → Database → Connection string` แล้วเลือก URI
-3. คัดลอกค่า URI ไปใส่ใน Render ที่ชื่อ `DATABASE_URL`
-4. กด Save และรอให้ Render deploy ใหม่
+## โครงสร้างไฟล์หลัก
 
-เมื่อมี `DATABASE_URL` บอทจะสร้างตาราง `documents` และเก็บข้อมูล PDF ใน PostgreSQL อัตโนมัติ
-ถ้ายังไม่ใส่ค่า บอทจะใช้ไฟล์ JSON สำรองเหมือนเดิม
+```
+index.js                  เริ่ม health server → Gateway login → ลงคำสั่ง → route interaction
+src/orchestrator.js       Multi-Agent workflow (แผน → ทีมคู่ขนาน → ตรวจ → สังเคราะห์) + heuristic
+src/providers.js          LLM adapter เดียว (OpenRouter / zai / mock) + timeout + stats
+src/commands.js           นิยาม slash commands ทั้ง 11 + ลงทะเบียน (guild ก่อน global)
+src/handlers.js           logic รายคำสั่ง + defer/แจ้งความคืบหน้า + chunk ข้อความยาว
+src/document-store.js     ความจำเอกสาร (Postgres หรือ JSON) + ค้นเอกสารที่เกี่ยวข้อง
+src/websearch.js          ค้นเว็บ zai → Bing → DuckDuckGo (fallback chain)
+src/pdf.js  src/memory.js  src/imagegen.js  src/textutil.js  src/safety.js  src/config.js  src/stats.js
+test/run-tests.js         ชุดทดสอบ 14 เคส
+scripts/simulate-ask.js   จำลอง /ask, /research แบบเต็มระบบ
+```
 
-**ห้ามใส่ `DATABASE_URL` ใน GitHub หรือส่งค่าในห้อง Discord** เพราะใน URI มีรหัสผ่านฐานข้อมูล
-
-## ข้อจำกัดของแพ็กเกจฟรี
-
-- โมเดลฟรีของ OpenRouter มีโควตาจำกัดต่อวัน ถ้าเจอข้อความ rate limit ให้เปลี่ยนโมเดลด้วย `/model`
-- รูปจาก Pollinations อาจใช้เวลา 10-60 วินาทีต่อรูป
-- Render free tier อาจพักการทำงานถ้าไม่มีใครเรียก `/health` (แก้ด้วย UptimeRobot ตามขั้นตอนในคู่มือ)
-- ความจำบทสนทนาเก็บใน RAM — ถ้าบอทรีสตาร์ท ความจำจะเริ่มใหม่
-- ถ้าไม่ตั้ง `DATABASE_URL` คลังเอกสารใช้ไฟล์ JSON; บน Render Free อาจไม่อยู่รอดหลัง deploy ใหม่
-- ถ้าตั้ง `DATABASE_URL` แล้ว ข้อมูลเอกสารจะอยู่ใน PostgreSQL และอยู่รอดหลัง deploy ใหม่
-
-## License
-
-MIT
+ดูวิธี deploy บน Render: [DEPLOY.md](DEPLOY.md)
