@@ -3,15 +3,31 @@
 // Discord AI Agent — Multi-Agent upgrade
 // One Gateway connection (discord.js) + HTTP health server for Render.
 // Slash commands: /ask /research /analyze /status /image /pdf /model /reset /files /forget /help
+//
+// LAYOUT NOTE: this file works with BOTH repo layouts —
+//   A) files inside `src/`          (zip / git clone layout)
+//   B) files flattened at the root   (GitHub "Add files via upload" layout)
 
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const { Client, GatewayIntentBits, ActivityType } = require('discord.js');
-const config = require('./src/config');
-const stats = require('./src/stats');
-const store = require('./src/document-store');
-const { registerCommands } = require('./src/commands');
-const { handleInteraction } = require('./src/handlers');
-const { providerName } = require('./src/providers');
+
+// Resolve a project module from ./src/<name> first, then ./<name> (flat layout).
+function resolveModule(name) {
+  const candidates = [path.join(__dirname, 'src', name), path.join(__dirname, name)];
+  for (const base of candidates) {
+    if (fs.existsSync(`${base}.js`)) return require(base);
+  }
+  throw new Error(`Cannot find module '${name}' — looked for src/${name}.js and ${name}.js`);
+}
+
+const config = resolveModule('config');
+const stats = resolveModule('stats');
+const store = resolveModule('document-store');
+const { registerCommands } = resolveModule('commands');
+const { handleInteraction } = resolveModule('handlers');
+const { providerName } = resolveModule('providers');
 
 // ---------------------------------------------------------------------------
 // Health server (Render) — starts FIRST so the service is always reachable.
