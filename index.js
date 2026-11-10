@@ -23,7 +23,7 @@ const { initDocumentStore, saveDocument, listDocuments, forgetDocuments, getDocC
 
 // ---------------- ตั้งค่าพื้นฐาน ----------------
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN || process.env.DISCORD_BOT_TOKEN;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const DEFAULT_MODEL =
   process.env.DEFAULT_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b:free';
@@ -399,6 +399,21 @@ const commands = [
         .setDescription('ให้ค้นอินเทอร์เน็ตก่อนตอบ (สำหรับข่าว/ข้อมูลใหม่ ๆ)')
     ),
   new SlashCommandBuilder()
+    .setName('research')
+    .setDescription('ค้นคว้าหัวข้อพร้อมแหล่งอ้างอิง')
+    .addStringOption((o) =>
+      o.setName('topic').setDescription('หัวข้อที่ต้องการค้นคว้า').setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName('analyze')
+    .setDescription('วิเคราะห์ข้อมูลหรือคำขอเชิงตัวเลข')
+    .addStringOption((o) =>
+      o.setName('request').setDescription('สิ่งที่ต้องการให้วิเคราะห์').setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('ดูสถานะ Discord AI Agent'),
+  new SlashCommandBuilder()
     .setName('image')
     .setDescription('สร้างรูปภาพจากคำบรรยาย (ฟรี)')
     .addStringOption((o) =>
@@ -662,6 +677,59 @@ client.on('interactionCreate', async (interaction) => {
             '❌ อ่าน PDF ไม่สำเร็จ: ' + err.message.slice(0, 300)
           );
         }
+      }
+      return;
+    }
+
+    if (interaction.commandName === 'status') {
+      await interaction.reply(
+        `✅ Discord AI Agent ออนไลน์แล้ว\n` +
+        `• Gateway: connected\n` +
+        `• Model provider: ${OPENROUTER_API_KEY ? 'configured' : 'missing OPENROUTER_API_KEY'}\n` +
+        `• Uptime: ${Math.floor(process.uptime() / 60)} นาที`
+      );
+      return;
+    }
+
+    if (interaction.commandName === 'research') {
+      const topic = interaction.options.getString('topic');
+      if (isOnCooldown(interaction.user.id)) {
+        await interaction.reply({ content: '⏳ ช้าหน่อยนะ พิมพ์เร็วเกินไป', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+      try {
+        const webContext = await webSearch(topic, 5);
+        const { answer, model } = await chatWithAI(
+          [{ role: 'user', content: `ค้นคว้าหัวข้อนี้และสรุปเป็นภาษาไทย พร้อมแหล่งอ้างอิง: ${topic}` }],
+          webContext,
+          ''
+        );
+        await interaction.editReply(`🔎 *Research Agent ใช้ ${model}*\n\n${answer}`.slice(0, 1990));
+      } catch (err) {
+        console.error('[research]', err.message);
+        await interaction.editReply('❌ ค้นคว้าไม่สำเร็จ: ' + err.message.slice(0, 300));
+      }
+      return;
+    }
+
+    if (interaction.commandName === 'analyze') {
+      const request = interaction.options.getString('request');
+      if (isOnCooldown(interaction.user.id)) {
+        await interaction.reply({ content: '⏳ ช้าหน่อยนะ พิมพ์เร็วเกินไป', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+      try {
+        const { answer, model } = await chatWithAI(
+          [{ role: 'user', content: `Data Analysis Agent ช่วยวิเคราะห์คำขอนี้อย่างเป็นขั้นตอน ระบุสมมติฐานและข้อจำกัด: ${request}` }],
+          '',
+          ''
+        );
+        await interaction.editReply(`📊 *Data Analysis Agent ใช้ ${model}*\n\n${answer}`.slice(0, 1990));
+      } catch (err) {
+        console.error('[analyze]', err.message);
+        await interaction.editReply('❌ วิเคราะห์ไม่สำเร็จ: ' + err.message.slice(0, 300));
       }
       return;
     }
